@@ -2,8 +2,10 @@
 import sys
 import json
 import time
+import shutil
 import sqlite3
 import argparse
+import subprocess
 from pathlib import Path
 
 import librosa
@@ -31,6 +33,102 @@ CAMELOT_MAP = {
 }
 
 DB_PATH = Path.home() / "music-analyzer" / "cache.db"
+NOTIF_ID = "mixliste_analiz"
+
+
+# ── İlerleme & bildirim ───────────────────────────────────────────────────────
+
+class ProgressReporter:
+    """Terminal progress bar + termux-notification (varsa) ile canlı durum."""
+
+    HAS_NOTIF = shutil.which("termux-notification") is not None
+    HAS_VIBRATE = shutil.which("termux-vibrate") is not None
+
+    def __init__(self, total: int):
+        self.total = total
+        self.current = 0
+        self.t0 = time.time()
+        self._track_times: list[float] = []
+        self._last_t = self.t0
+
+    # ── internal ──────────────────────────────────────────────────────────────
+
+    def _bar(self) -> str:
+        pct = self.current / max(self.total, 1)
+        filled = int(30 * pct)
+        return "█" * filled + "░" * (30 - filled)
+
+    def _eta(self) -> str:
+        if not self._track_times:
+            return ""
+        avg = sum(self._track_times) / len(self._track_times)
+        secs = avg * (self.total - self.current)
+        if secs < 60:
+            return f"~{int(secs)}sn kaldı"
+        return f"~{int(secs // 60)}dk {int(secs % 60)}sn kaldı"
+
+    def _notify(self, title: str, content: str, ongoing: bool = True, sound: bool = False):
+        if not self.HAS_NOTIF:
+            return
+        cmd = [
+            "termux-notification",
+            "--id", NOTIF_ID,
+            "--title", title,
+            "--content", content,
+            "--priority", "low" if ongoing else "high",
+        ]
+        if ongoing:
+            cmd.append("--ongoing")
+        if sound:
+            cmd.append("--sound")
+        subprocess.run(cmd, capture_output=True)
+
+    def _dismiss_notification(self):
+        if self.HAS_NOTIF:
+            subprocess.run(
+                ["termux-notification-remove", NOTIF_ID],
+                capture_output=True,
+            )
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def loading(self, name: str):
+        """Dosya yüklenirken göster — librosa sessizliğini maskeler."""
+        print(f"  ⏳ yükleniyor: {name[:50]}", flush=True)
+
+    def track_done(self, name: str, from_cache: bool):
+        now = time.time()
+        if not from_cache:
+            self._track_times.append(now - self._last_t)
+        self._last_t = now
+        self.current += 1
+
+        pct = int(100 * self.current / max(self.total, 1))
+        eta = self._eta()
+        label = "[önbellek]" if from_cache else "[analiz]  "
+        print(f"  {label} {self.current}/{self.total} ({pct}%)  {eta}")
+        print(f"  [{self._bar()}]\n")
+
+        notif_content = f"{self.current}/{self.total} • {name[:40]}  {eta}"
+        self._notify("Mix Liste Analiz Ediliyor", notif_content)
+
+    def finish(self, cached: int, fresh: int, playlist_path: str | None = None):
+        elapsed = time.time() - self.t0
+        mins, secs = divmod(int(elapsed), 60)
+        time_str = f"{mins}dk {secs}sn" if mins else f"{secs}sn"
+
+        print(f"\nToplam süre: {time_str}")
+        print(f"Önbellekten: {cached}  |  Yeni analiz: {fresh}")
+
+        self._dismiss_notification()
+
+        content = f"{self.total} şarkı hazır ({time_str})"
+        if playlist_path:
+            content += f"\n{playlist_path}"
+        self._notify("Mix Liste Hazır!", content, ongoing=False, sound=True)
+
+        if self.HAS_VIBRATE:
+            subprocess.run(["termux-vibrate", "-d", "300"], capture_output=True)
 
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
@@ -209,7 +307,12 @@ class MusicAnalyzer:
     def get_camelot_key(self, key: str, mode: str = "major") -> str | None:
         return CAMELOT_MAP.get(key, {}).get(mode)
 
-    def analyze_file(self, file_path, cache: AnalysisCache | None = None) -> dict:
+    def analyze_file(
+        self,
+        file_path,
+        cache: AnalysisCache | None = None,
+        progress: ProgressReporter | None = None,
+    ) -> dict:
         file_path = Path(file_path)
 
         if cache:
@@ -217,11 +320,14 @@ class MusicAnalyzer:
             if hit:
                 bpm_s = str(hit["bpm"]) if hit["bpm"] else "?"
                 cam_s = hit["camelot"] or "?"
-                print(f"  [önbellek] {file_path.name}")
                 print(f"    BPM: {bpm_s} | Key: {hit['key'] or '?'} {hit['mode'] or ''} | Camelot: {cam_s}")
+                if progress:
+                    progress.track_done(file_path.name, from_cache=True)
                 return hit
 
-        print(f"  [analiz]   {file_path.name}")
+        if progress:
+            progress.loading(file_path.name)
+
         bpm = self._analyze_bpm(file_path)
         key, mode = self._analyze_key_and_mode(file_path)
         camelot = self.get_camelot_key(key, mode) if key else None
@@ -230,6 +336,8 @@ class MusicAnalyzer:
         result = {"file": file_path, "bpm": bpm, "key": key, "mode": mode, "camelot": camelot}
         if cache:
             cache.save(result)
+        if progress:
+            progress.track_done(file_path.name, from_cache=False)
         return result
 
     def update_filename(self, file_path, bpm, camelot) -> Path:
@@ -382,23 +490,24 @@ def main():
         print(f"{total} dosya bulundu, {len(music_files)} tanesi işlenecek\n")
 
     # ── Analiz döngüsü ────────────────────────────────────────────────────────
+    progress = ProgressReporter(len(music_files))
     results = []
-    fresh = 0
-    for i, fp in enumerate(music_files):
-        print(f"[{i + 1}/{len(music_files)}]", end=" ")
-        result = analyzer.analyze_file(fp, cache)
-        if not result.get("_from_cache"):
-            fresh += 1
+
+    for fp in music_files:
+        result = analyzer.analyze_file(fp, cache, progress)
         if args.rename and result["bpm"]:
             result["file"] = analyzer.update_filename(result["file"], result["bpm"], result["camelot"])
         results.append(result)
 
+    fresh = sum(1 for r in results if not r.get("_from_cache"))
     cached_count = len(results) - fresh
-    print(f"\nÖnbellekten: {cached_count}  |  Yeni analiz: {fresh}")
 
+    playlist_path = None
     if not args.no_playlist:
         playlist_path = Path(args.output) if args.output else Path(folder_path) / "mix_playlist.m3u"
         analyzer.generate_playlist(results, playlist_path, absolute_paths=args.absolute_paths)
+
+    progress.finish(cached_count, fresh, str(playlist_path) if playlist_path else None)
 
     print("\n" + "=" * 58)
     print("ANALİZ ÖZETİ  (harmonik sıralama)")
