@@ -219,6 +219,7 @@ def main():
         """,
     )
     parser.add_argument('path', nargs='?', help='Analiz edilecek klasör yolu')
+    parser.add_argument('--files', nargs='+', help='Analiz edilecek belirli dosyalar')
     parser.add_argument('--rename', action='store_true', help='Dosya adlarını BPM ve key ile güncelle')
     parser.add_argument('--single', help='Tek dosya analizi')
     parser.add_argument('--output', help='Playlist çıktı dosyası (varsayılan: <klasör>/mix_playlist.m3u)')
@@ -239,18 +240,24 @@ def main():
             analyzer.update_filename(file_path, result['bpm'], result['camelot'])
         return
 
-    folder_path = args.path or "/storage/emulated/0/Music"
-    print(f"Müzik dosyaları aranıyor: {folder_path}")
-    music_files = analyzer.find_music_files(folder_path)
-
-    if not music_files:
-        print("Hiç müzik dosyası bulunamadı!")
-        sys.exit(1)
-
-    total = len(music_files)
-    if args.limit > 0:
-        music_files = music_files[: args.limit]
-    print(f"{total} dosya bulundu, {len(music_files)} tanesi analiz edilecek\n")
+    if args.files:
+        music_files = [Path(f) for f in args.files if Path(f).exists()]
+        if not music_files:
+            print("Hiç dosya bulunamadı!")
+            sys.exit(1)
+        folder_path = str(music_files[0].parent)
+        print(f"{len(music_files)} dosya analiz edilecek\n")
+    else:
+        folder_path = args.path or "/storage/emulated/0/Music"
+        print(f"Müzik dosyaları aranıyor: {folder_path}")
+        music_files = analyzer.find_music_files(folder_path)
+        if not music_files:
+            print("Hiç müzik dosyası bulunamadı!")
+            sys.exit(1)
+        total = len(music_files)
+        if args.limit > 0:
+            music_files = music_files[: args.limit]
+        print(f"{total} dosya bulundu, {len(music_files)} tanesi analiz edilecek\n")
 
     results = []
     for i, file_path in enumerate(music_files):
