@@ -18,7 +18,10 @@ echo ""
 # ── 1. Sistem paketleri ───────────────────────────────────────────────────────
 echo "► Sistem paketleri kuruluyor..."
 pkg update -y -q
-pkg install -y -q curl unzip python python-pip clang libsndfile
+# numpy ve scipy pkg üzerinden kurulur — Android için önceden derlenmiş,
+# pip üzerinden kurulmaz çünkü numba gibi derleme gerektiren bağımlılıkları çeker
+pkg install -y -q curl unzip python python-pip clang libsndfile \
+    python-numpy python-scipy
 echo "  ✓ Sistem paketleri hazır"
 echo ""
 
@@ -37,13 +40,26 @@ fi
 
 mv "$TMP_DIR"/android_mix_list_-generate-* "$INSTALL_DIR"
 rm -rf "$TMP_DIR"
-chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/create_shortcut.sh"
+chmod +x "$INSTALL_DIR/start.sh"
 echo "  ✓ Dosyalar hazır"
 echo ""
 
 # ── 3. Python bağımlılıkları ──────────────────────────────────────────────────
-echo "► Python kütüphaneleri kuruluyor (bu biraz sürebilir)..."
-pip install -q -r "$INSTALL_DIR/requirements.txt"
+echo "► Python kütüphaneleri kuruluyor..."
+# numba ve llvmlite hariç — bunlar Android ARM'da kaynak koddan derlenemez.
+# librosa numba olmadan çalışır (sadece bazı işlemler daha yavaş olur).
+pip install -q --no-deps \
+    "librosa>=0.10.0" \
+    "mutagen>=1.46.0"
+pip install -q \
+    audioread \
+    soundfile \
+    pooch \
+    "scikit-learn>=1.0" \
+    decorator \
+    "lazy-loader>=0.1" \
+    msgpack \
+    soxr
 echo "  ✓ Kütüphaneler hazır"
 echo ""
 
