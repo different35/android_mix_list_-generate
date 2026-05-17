@@ -18,6 +18,12 @@ cd ~/music-analyzer
 bash setup_termux.sh
 ```
 
+Kurulum tamamlandığında ana ekran kısayolu otomatik oluşturulur.  
+Kısayolu görmek için:
+1. F-Droid'den **Termux:Widget** uygulamasını yükleyin
+2. Ana ekranda boş alana uzun basın → **Widget ekle**
+3. Termux:Widget'ı seçin → **Mix Liste Oluştur** görünecek
+
 ## Kullanım
 
 ```bash
