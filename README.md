@@ -1,2 +1,29 @@
-# android_mix_list_-generate
-telefonunuzdaki müziklerden mixlemek üzarə çalma listesi uzantılarına sahip listeler oluşturun, sıralı çalma özelliği bulunan playerlarda harmonik mixing uyumlu listenizi açın ve keyfinize bakın.
+# Mix Liste Oluşturucu
+
+Android telefonunuzdaki müzikleri analiz eder, harmonik olarak uyumlu bir çalma listesi oluşturur. Kurulum bir kez yapılır, sonrasında ana ekrandaki kısayola basmak yeterli.
+
+## Kurulum (bir kez)
+
+Termux'u açın ve şu komutu çalıştırın:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/different35/android_mix_list_-generate/main/install.sh | bash
+```
+
+GitHub hesabı veya şifre gerekmez. Kurulum bitince "**Ekle**" diyaloğu açılır — basın, kısayol ana ekrana eklenir.
+
+## Kullanım
+
+1. Ana ekrandaki **Mix Liste Oluştur** kısayoluna bas
+2. Müzik klasörünü seç
+3. **Tüm klasörü analiz et** veya **Şarkı seç**
+4. Şarkı seçtiysen listeden işaretle → **Tamam**
+5. Bitti — analiz ilerlerken bildirim çubuğunda durum görünür, bitince uyarı gelir
+
+Oluşturulan `mix_playlist.m3u` dosyasını VLC, Poweramp veya sıralı çalma destekleyen herhangi bir player ile açın.
+
+## Ne yapar?
+
+Her şarkının BPM ve tonunu tespit eder, Camelot Wheel uyumuna göre sıralar. Bir şarkıdan diğerine geçişler harmonik olarak uyumlu olur — DJ mixing mantığıyla.
+
+Analiz sonuçları cihazda saklanır. Aynı şarkı bir daha analiz edilmez, her açılışta anında yüklenir.

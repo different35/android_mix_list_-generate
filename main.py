@@ -1,194 +1,529 @@
 #!/usr/bin/env python3
-import os
 import sys
 import json
+import time
+import shutil
+import sqlite3
+import argparse
+import subprocess
 from pathlib import Path
+
 import librosa
 import numpy as np
 from mutagen import File
-import argparse
+
+MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+KEY_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+CAMELOT_MAP = {
+    'C':  {'major': '8B', 'minor': '5A'},
+    'C#': {'major': '3B', 'minor': '12A'},
+    'D':  {'major': '10B', 'minor': '7A'},
+    'D#': {'major': '5B', 'minor': '2A'},
+    'E':  {'major': '12B', 'minor': '9A'},
+    'F':  {'major': '7B', 'minor': '4A'},
+    'F#': {'major': '2B', 'minor': '11A'},
+    'G':  {'major': '9B', 'minor': '6A'},
+    'G#': {'major': '4B', 'minor': '1A'},
+    'A':  {'major': '11B', 'minor': '8A'},
+    'A#': {'major': '6B', 'minor': '3A'},
+    'B':  {'major': '1B', 'minor': '10A'},
+}
+
+DB_PATH = Path.home() / "music-analyzer" / "cache.db"
+NOTIF_ID = "mixliste_analiz"
+
+
+# ── İlerleme & bildirim ───────────────────────────────────────────────────────
+
+class ProgressReporter:
+    """Terminal progress bar + termux-notification (varsa) ile canlı durum."""
+
+    HAS_NOTIF = shutil.which("termux-notification") is not None
+    HAS_VIBRATE = shutil.which("termux-vibrate") is not None
+
+    def __init__(self, total: int):
+        self.total = total
+        self.current = 0
+        self.t0 = time.time()
+        self._track_times: list[float] = []
+        self._last_t = self.t0
+
+    # ── internal ──────────────────────────────────────────────────────────────
+
+    def _bar(self) -> str:
+        pct = self.current / max(self.total, 1)
+        filled = int(30 * pct)
+        return "█" * filled + "░" * (30 - filled)
+
+    def _eta(self) -> str:
+        if not self._track_times:
+            return ""
+        avg = sum(self._track_times) / len(self._track_times)
+        secs = avg * (self.total - self.current)
+        if secs < 60:
+            return f"~{int(secs)}sn kaldı"
+        return f"~{int(secs // 60)}dk {int(secs % 60)}sn kaldı"
+
+    def _notify(self, title: str, content: str, ongoing: bool = True, sound: bool = False):
+        if not self.HAS_NOTIF:
+            return
+        cmd = [
+            "termux-notification",
+            "--id", NOTIF_ID,
+            "--title", title,
+            "--content", content,
+            "--priority", "low" if ongoing else "high",
+        ]
+        if ongoing:
+            cmd.append("--ongoing")
+        if sound:
+            cmd.append("--sound")
+        subprocess.run(cmd, capture_output=True)
+
+    def _dismiss_notification(self):
+        if self.HAS_NOTIF:
+            subprocess.run(
+                ["termux-notification-remove", NOTIF_ID],
+                capture_output=True,
+            )
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def loading(self, name: str):
+        """Dosya yüklenirken göster — librosa sessizliğini maskeler."""
+        print(f"  ⏳ yükleniyor: {name[:50]}", flush=True)
+
+    def track_done(self, name: str, from_cache: bool):
+        now = time.time()
+        if not from_cache:
+            self._track_times.append(now - self._last_t)
+        self._last_t = now
+        self.current += 1
+
+        pct = int(100 * self.current / max(self.total, 1))
+        eta = self._eta()
+        label = "[önbellek]" if from_cache else "[analiz]  "
+        print(f"  {label} {self.current}/{self.total} ({pct}%)  {eta}")
+        print(f"  [{self._bar()}]\n")
+
+        notif_content = f"{self.current}/{self.total} • {name[:40]}  {eta}"
+        self._notify("Mix Liste Analiz Ediliyor", notif_content)
+
+    def finish(self, cached: int, fresh: int, playlist_path: str | None = None):
+        elapsed = time.time() - self.t0
+        mins, secs = divmod(int(elapsed), 60)
+        time_str = f"{mins}dk {secs}sn" if mins else f"{secs}sn"
+
+        print(f"\nToplam süre: {time_str}")
+        print(f"Önbellekten: {cached}  |  Yeni analiz: {fresh}")
+
+        self._dismiss_notification()
+
+        content = f"{self.total} şarkı hazır ({time_str})"
+        if playlist_path:
+            content += f"\n{playlist_path}"
+        self._notify("Mix Liste Hazır!", content, ongoing=False, sound=True)
+
+        if self.HAS_VIBRATE:
+            subprocess.run(["termux-vibrate", "-d", "300"], capture_output=True)
+
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+
+class AnalysisCache:
+    """SQLite-backed persistent store for track analysis results."""
+
+    def __init__(self):
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tracks (
+                path        TEXT    PRIMARY KEY,
+                mtime       REAL    NOT NULL,
+                bpm         INTEGER,
+                key         TEXT,
+                mode        TEXT,
+                camelot     TEXT,
+                analyzed_at REAL    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tracks_mtime ON tracks(mtime);
+        """)
+        self._conn.commit()
+
+    def get(self, file_path: Path) -> dict | None:
+        """Return cached result if file is unchanged, else None."""
+        try:
+            mtime = file_path.stat().st_mtime
+        except OSError:
+            return None
+
+        row = self._conn.execute(
+            "SELECT bpm, key, mode, camelot, mtime FROM tracks WHERE path = ?",
+            (str(file_path),)
+        ).fetchone()
+
+        if row and abs(row["mtime"] - mtime) < 1.0:
+            return {
+                "file": file_path,
+                "bpm": row["bpm"],
+                "key": row["key"],
+                "mode": row["mode"],
+                "camelot": row["camelot"],
+                "_from_cache": True,
+            }
+        return None
+
+    def save(self, result: dict):
+        """Persist an analysis result."""
+        fp = result["file"]
+        try:
+            mtime = fp.stat().st_mtime
+        except OSError:
+            return
+        self._conn.execute(
+            """INSERT OR REPLACE INTO tracks
+               (path, mtime, bpm, key, mode, camelot, analyzed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (str(fp), mtime, result["bpm"], result["key"],
+             result["mode"], result["camelot"], time.time()),
+        )
+        self._conn.commit()
+
+    def stats(self) -> dict:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN bpm IS NOT NULL THEN 1 ELSE 0 END) AS analyzed "
+            "FROM tracks"
+        ).fetchone()
+        return {"total": row["total"] or 0, "analyzed": row["analyzed"] or 0}
+
+    def purge_missing(self) -> int:
+        """Delete entries whose files no longer exist on disk."""
+        paths = [r[0] for r in self._conn.execute("SELECT path FROM tracks").fetchall()]
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            self._conn.executemany("DELETE FROM tracks WHERE path = ?", [(p,) for p in missing])
+            self._conn.commit()
+        return len(missing)
+
+    def all_tracks(self) -> list[dict]:
+        """Return every cached track as a result dict."""
+        rows = self._conn.execute(
+            "SELECT path, bpm, key, mode, camelot FROM tracks ORDER BY path"
+        ).fetchall()
+        return [
+            {"file": Path(r["path"]), "bpm": r["bpm"], "key": r["key"],
+             "mode": r["mode"], "camelot": r["camelot"]}
+            for r in rows if Path(r["path"]).exists()
+        ]
+
+    def close(self):
+        self._conn.close()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def camelot_compatibility(key1: str, key2: str) -> int:
+    if not key1 or not key2:
+        return 0
+    if key1 == key2:
+        return 3
+    num1, letter1 = int(key1[:-1]), key1[-1]
+    num2, letter2 = int(key2[:-1]), key2[-1]
+    if num1 == num2:
+        return 2
+    if letter1 == letter2 and abs(num1 - num2) in (1, 11):
+        return 1
+    return 0
+
+
+# ── Analyzer ──────────────────────────────────────────────────────────────────
 
 class MusicAnalyzer:
     def __init__(self):
         self.config_path = Path.home() / "music-analyzer" / "config" / "settings.json"
         self.load_config()
-        
+
     def load_config(self):
-        """Ayarları yükle"""
         if self.config_path.exists():
-            with open(self.config_path, 'r') as f:
+            with open(self.config_path, "r") as f:
                 self.config = json.load(f)
         else:
             self.config = {
-                "analysis_duration": 30,  # saniye
+                "analysis_duration": 30,
                 "music_folders": ["/storage/emulated/0/Music", "/storage/emulated/0/Download"],
-                "supported_formats": [".mp3", ".wav", ".m4a", ".flac"]
+                "supported_formats": [".mp3", ".wav", ".m4a", ".flac"],
             }
             self.save_config()
-    
+
     def save_config(self):
-        """Ayarları kaydet"""
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.config_path, 'w') as f:
+        with open(self.config_path, "w") as f:
             json.dump(self.config, f, indent=2)
-    
+
     def find_music_files(self, folder_path):
-        """Ses dosyalarını bul"""
-        music_files = []
         folder = Path(folder_path)
-        
         if not folder.exists():
             print(f"Klasör bulunamadı: {folder_path}")
-            return music_files
-            
+            return []
+        files = []
         for ext in self.config["supported_formats"]:
-            music_files.extend(folder.glob(f"**/*{ext}"))
-        
-        return music_files
-    
-    def analyze_bpm(self, file_path):
-        """BPM analizi"""
+            files.extend(folder.glob(f"**/*{ext}"))
+        return sorted(files)
+
+    def _analyze_bpm(self, file_path) -> int | None:
         try:
-            # Dosyanın ilk 30 saniyesini analiz et
-            y, sr = librosa.load(file_path, duration=self.config["analysis_duration"])
+            y, sr = librosa.load(str(file_path), duration=self.config["analysis_duration"])
             tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            return int(tempo)
+            return round(float(np.atleast_1d(tempo)[0]))
         except Exception as e:
-            print(f"BPM analizi hatası: {e}")
+            print(f"    BPM hatası: {e}")
             return None
-    
-    def analyze_key(self, file_path):
-        """Key analizi (basit versiyon)"""
+
+    def _analyze_key_and_mode(self, file_path) -> tuple[str | None, str | None]:
         try:
-            y, sr = librosa.load(file_path, duration=self.config["analysis_duration"])
+            y, sr = librosa.load(str(file_path), duration=self.config["analysis_duration"])
             chroma = librosa.feature.chroma_stft(y=y, sr=sr)
             chroma_mean = np.mean(chroma, axis=1)
-            
-            # Basit key detection
-            keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            key_index = np.argmax(chroma_mean)
-            return keys[key_index]
+            best_score, best_key, best_mode = -np.inf, None, None
+            for i in range(12):
+                rotated = np.roll(chroma_mean, -i)
+                for profile, mode in ((MAJOR_PROFILE, "major"), (MINOR_PROFILE, "minor")):
+                    score = float(np.corrcoef(rotated, profile)[0, 1])
+                    if score > best_score:
+                        best_score, best_key, best_mode = score, KEY_NAMES[i], mode
+            return best_key, best_mode
         except Exception as e:
-            print(f"Key analizi hatası: {e}")
-            return None
-    
-    def get_camelot_key(self, musical_key, mode="major"):
-        """Musical key'i Camelot wheel'e çevir"""
-        camelot_map = {
-            'C': {'major': '8B', 'minor': '5A'},
-            'C#': {'major': '3B', 'minor': '12A'},
-            'D': {'major': '10B', 'minor': '7A'},
-            'D#': {'major': '5B', 'minor': '2A'},
-            'E': {'major': '12B', 'minor': '9A'},
-            'F': {'major': '7B', 'minor': '4A'},
-            'F#': {'major': '2B', 'minor': '11A'},
-            'G': {'major': '9B', 'minor': '6A'},
-            'G#': {'major': '4B', 'minor': '1A'},
-            'A': {'major': '11B', 'minor': '8A'},
-            'A#': {'major': '6B', 'minor': '3A'},
-            'B': {'major': '1B', 'minor': '10A'}
-        }
-        
-        if musical_key in camelot_map:
-            return camelot_map[musical_key][mode]
-        return None
-    
-    def analyze_file(self, file_path):
-        """Tek dosya analizi"""
-        print(f"\nAnaliz ediliyor: {file_path.name}")
-        
-        # BPM analizi
-        bpm = self.analyze_bpm(file_path)
-        print(f"BPM: {bpm}")
-        
-        # Key analizi
-        key = self.analyze_key(file_path)
-        camelot = self.get_camelot_key(key) if key else None
-        print(f"Key: {key} (Camelot: {camelot})")
-        
-        return {
-            'file': file_path,
-            'bpm': bpm,
-            'key': key,
-            'camelot': camelot
-        }
-    
-    def update_filename(self, file_path, bpm, camelot):
-        """Dosya adını güncelle"""
+            print(f"    Key hatası: {e}")
+            return None, None
+
+    def get_camelot_key(self, key: str, mode: str = "major") -> str | None:
+        return CAMELOT_MAP.get(key, {}).get(mode)
+
+    def analyze_file(
+        self,
+        file_path,
+        cache: AnalysisCache | None = None,
+        progress: ProgressReporter | None = None,
+    ) -> dict:
+        file_path = Path(file_path)
+
+        if cache:
+            hit = cache.get(file_path)
+            if hit:
+                bpm_s = str(hit["bpm"]) if hit["bpm"] else "?"
+                cam_s = hit["camelot"] or "?"
+                print(f"    BPM: {bpm_s} | Key: {hit['key'] or '?'} {hit['mode'] or ''} | Camelot: {cam_s}")
+                if progress:
+                    progress.track_done(file_path.name, from_cache=True)
+                return hit
+
+        if progress:
+            progress.loading(file_path.name)
+
+        bpm = self._analyze_bpm(file_path)
+        key, mode = self._analyze_key_and_mode(file_path)
+        camelot = self.get_camelot_key(key, mode) if key else None
+        print(f"    BPM: {bpm} | Key: {key or '?'} {mode or ''} | Camelot: {camelot or '?'}")
+
+        result = {"file": file_path, "bpm": bpm, "key": key, "mode": mode, "camelot": camelot}
+        if cache:
+            cache.save(result)
+        if progress:
+            progress.track_done(file_path.name, from_cache=False)
+        return result
+
+    def update_filename(self, file_path, bpm, camelot) -> Path:
         try:
-            old_name = file_path.stem
-            extension = file_path.suffix
-            
-            # Eğer zaten analiz bilgisi varsa temizle
-            if " [BPM:" in old_name:
-                old_name = old_name.split(" [BPM:")[0]
-            
-            # Yeni isim oluştur
+            file_path = Path(file_path)
+            stem = file_path.stem
+            if " [BPM:" in stem:
+                stem = stem.split(" [BPM:")[0]
             if bpm and camelot:
-                new_name = f"{old_name} [BPM:{bpm}] [Key:{camelot}]{extension}"
+                new_name = f"{stem} [BPM:{bpm}] [Key:{camelot}]{file_path.suffix}"
             elif bpm:
-                new_name = f"{old_name} [BPM:{bpm}]{extension}"
+                new_name = f"{stem} [BPM:{bpm}]{file_path.suffix}"
             else:
-                return False
-                
+                return file_path
             new_path = file_path.parent / new_name
             file_path.rename(new_path)
-            print(f"Dosya adı güncellendi: {new_name}")
-            return True
-            
+            print(f"    → {new_name}")
+            return new_path
         except Exception as e:
-            print(f"Dosya adı güncellenirken hata: {e}")
-            return False
+            print(f"  Dosya adı hatası: {e}")
+            return file_path
+
+    def sort_by_harmonic_compatibility(self, results: list) -> list:
+        keyed = [r for r in results if r["camelot"]]
+        no_key = [r for r in results if not r["camelot"]]
+        if not keyed:
+            return no_key
+        ordered = [keyed.pop(0)]
+        while keyed:
+            current = ordered[-1]
+            best_idx, best_score = 0, -1
+            for i, candidate in enumerate(keyed):
+                score = camelot_compatibility(current["camelot"], candidate["camelot"]) * 10
+                if current["bpm"] and candidate["bpm"]:
+                    diff = abs(current["bpm"] - candidate["bpm"])
+                    score += 2 if diff <= 5 else (1 if diff <= 10 else 0)
+                if score > best_score:
+                    best_score, best_idx = score, i
+            ordered.append(keyed.pop(best_idx))
+        return ordered + no_key
+
+    def generate_playlist(self, results: list, output_path, absolute_paths: bool = False) -> Path:
+        output_path = Path(output_path)
+        sorted_results = self.sort_by_harmonic_compatibility(results)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n")
+            for r in sorted_results:
+                bpm_s = str(r["bpm"]) if r["bpm"] else "?"
+                cam_s = r["camelot"] if r["camelot"] else "?"
+                f.write(f"#EXTINF:-1,{r['file'].stem} [BPM:{bpm_s}] [{cam_s}]\n")
+                if absolute_paths:
+                    f.write(f"{r['file']}\n")
+                else:
+                    try:
+                        f.write(f"{r['file'].relative_to(output_path.parent)}\n")
+                    except ValueError:
+                        f.write(f"{r['file']}\n")
+        print(f"\nPlaylist oluşturuldu: {output_path}  ({len(sorted_results)} parça)")
+        return output_path
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Termux Müzik Analiz Aracı')
-    parser.add_argument('path', nargs='?', help='Analiz edilecek klasör yolu')
-    parser.add_argument('--rename', action='store_true', help='Dosya adlarını güncelle')
-    parser.add_argument('--single', help='Tek dosya analizi')
-    
+    parser = argparse.ArgumentParser(
+        description="Android Müzik Mix Listesi Oluşturucu",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Örnekler:
+  python main.py /sdcard/Music
+  python main.py /sdcard/Music --rename
+  python main.py --files a.mp3 b.mp3 c.mp3
+  python main.py --single sarki.mp3
+  python main.py --cache-stats
+  python main.py --cache-purge
+        """,
+    )
+    parser.add_argument("path", nargs="?", help="Analiz edilecek klasör")
+    parser.add_argument("--files", nargs="+", help="Belirli dosyalar")
+    parser.add_argument("--single", help="Tek dosya analizi")
+    parser.add_argument("--rename", action="store_true", help="Dosya adlarını güncelle")
+    parser.add_argument("--output", help="Playlist çıktı yolu")
+    parser.add_argument("--no-playlist", action="store_true", help="Playlist oluşturma")
+    parser.add_argument("--limit", type=int, default=0, help="Maksimum dosya sayısı (0=sınırsız)")
+    parser.add_argument("--absolute-paths", action="store_true", help="Playlist içinde mutlak yol")
+    parser.add_argument("--no-cache", action="store_true", help="Önbelleği atla, yeniden analiz et")
+    parser.add_argument("--cache-stats", action="store_true", help="Önbellek istatistiklerini göster")
+    parser.add_argument("--cache-purge", action="store_true", help="Silinmiş dosyaları önbellekten temizle")
     args = parser.parse_args()
-    
+
+    cache = None if args.no_cache else AnalysisCache()
+
+    # ── Cache yönetim komutları ────────────────────────────────────────────────
+    if args.cache_stats:
+        if not cache:
+            print("Önbellek devre dışı.")
+            return
+        s = cache.stats()
+        print(f"Önbellek: {DB_PATH}")
+        print(f"  Toplam kayıt : {s['total']}")
+        print(f"  Analiz edilmiş: {s['analyzed']}")
+        cache.close()
+        return
+
+    if args.cache_purge:
+        c = cache or AnalysisCache()
+        n = c.purge_missing()
+        print(f"{n} eksik kayıt temizlendi.")
+        c.close()
+        return
+
     analyzer = MusicAnalyzer()
-    
+
+    if cache:
+        s = cache.stats()
+        if s["total"]:
+            print(f"Önbellek: {s['total']} şarkı kayıtlı  ({DB_PATH})\n")
+
+    # ── Tek dosya ─────────────────────────────────────────────────────────────
     if args.single:
-        # Tek dosya analizi
-        file_path = Path(args.single)
-        if file_path.exists():
-            result = analyzer.analyze_file(file_path)
-            if args.rename and result['bpm']:
-                analyzer.update_filename(file_path, result['bpm'], result['camelot'])
-        else:
+        fp = Path(args.single)
+        if not fp.exists():
             print("Dosya bulunamadı!")
+            sys.exit(1)
+        result = analyzer.analyze_file(fp, cache)
+        if args.rename and result["bpm"]:
+            analyzer.update_filename(fp, result["bpm"], result["camelot"])
+        if cache:
+            cache.close()
         return
-    
-    # Klasör analizi
-    folder_path = args.path if args.path else "/storage/emulated/0/Music"
-    
-    print(f"Müzik dosyaları aranıyor: {folder_path}")
-    music_files = analyzer.find_music_files(folder_path)
-    
-    if not music_files:
-        print("Hiç müzik dosyası bulunamadı!")
-        return
-    
-    print(f"{len(music_files)} dosya bulundu\n")
-    
+
+    # ── Dosya listesi veya klasör ──────────────────────────────────────────────
+    if args.files:
+        music_files = [Path(f) for f in args.files if Path(f).exists()]
+        if not music_files:
+            print("Hiç dosya bulunamadı!")
+            sys.exit(1)
+        folder_path = str(music_files[0].parent)
+        print(f"{len(music_files)} dosya analiz edilecek\n")
+    else:
+        folder_path = args.path or "/storage/emulated/0/Music"
+        print(f"Müzik dosyaları aranıyor: {folder_path}")
+        music_files = analyzer.find_music_files(folder_path)
+        if not music_files:
+            print("Hiç müzik dosyası bulunamadı!")
+            sys.exit(1)
+        total = len(music_files)
+        if args.limit > 0:
+            music_files = music_files[: args.limit]
+        print(f"{total} dosya bulundu, {len(music_files)} tanesi işlenecek\n")
+
+    # ── Analiz döngüsü ────────────────────────────────────────────────────────
+    progress = ProgressReporter(len(music_files))
     results = []
-    for i, file_path in enumerate(music_files[:10]):  # İlk 10 dosya test için
-        print(f"İlerleme: {i+1}/{min(10, len(music_files))}")
-        result = analyzer.analyze_file(file_path)
+
+    for fp in music_files:
+        result = analyzer.analyze_file(fp, cache, progress)
+        if args.rename and result["bpm"]:
+            result["file"] = analyzer.update_filename(result["file"], result["bpm"], result["camelot"])
         results.append(result)
-        
-        if args.rename and result['bpm']:
-            analyzer.update_filename(result['file'], result['bpm'], result['camelot'])
-    
-    # Özet
-    print("\n" + "="*50)
-    print("ANALİZ ÖZETİ")
-    print("="*50)
-    for result in results:
-        print(f"{result['file'].name}")
-        print(f"  BPM: {result['bpm']} | Key: {result['key']} | Camelot: {result['camelot']}")
+
+    fresh = sum(1 for r in results if not r.get("_from_cache"))
+    cached_count = len(results) - fresh
+
+    playlist_path = None
+    if not args.no_playlist:
+        playlist_path = Path(args.output) if args.output else Path(folder_path) / "mix_playlist.m3u"
+        analyzer.generate_playlist(results, playlist_path, absolute_paths=args.absolute_paths)
+
+    progress.finish(cached_count, fresh, str(playlist_path) if playlist_path else None)
+
+    print("\n" + "=" * 58)
+    print("ANALİZ ÖZETİ  (harmonik sıralama)")
+    print("=" * 58)
+    for r in analyzer.sort_by_harmonic_compatibility(results):
+        name = r["file"].name
+        if len(name) > 40:
+            name = name[:37] + "..."
+        bpm_s = str(r["bpm"]) if r["bpm"] else "   ?"
+        key_s = f"{r['key'] or '?':>2} {r['mode'] or '':6}"
+        cam_s = r["camelot"] or " ?"
+        print(f"  {name:<40}  BPM:{bpm_s:>4}  {key_s}  [{cam_s}]")
+
+    if cache:
+        cache.close()
+
 
 if __name__ == "__main__":
     main()
