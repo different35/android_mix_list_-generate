@@ -1,7 +1,6 @@
 #!/bin/bash
-# Tek komutla kurulum — git veya GitHub hesabı gerekmez.
-# Kullanım:
-#   curl -fsSL https://raw.githubusercontent.com/different35/android_mix_list_-generate/main/install.sh | bash
+# Mix Liste Oluşturucu — tam kurulum
+# Kullanım: curl -fsSL https://raw.githubusercontent.com/different35/android_mix_list_-generate/main/install.sh | bash
 
 set -e
 
@@ -10,35 +9,69 @@ ZIP_URL="https://github.com/different35/android_mix_list_-generate/archive/refs/
 TMP_ZIP="/tmp/mixliste_setup.zip"
 TMP_DIR="/tmp/mixliste_setup"
 
-echo "=== Mix Liste Oluşturucu ==="
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║     Mix Liste Oluşturucu Kurulum     ║"
+echo "╚══════════════════════════════════════╝"
 echo ""
 
-# Gerekli araçlar
-pkg install -y curl unzip 2>/dev/null || true
+# ── 1. Sistem paketleri ───────────────────────────────────────────────────────
+echo "► Sistem paketleri kuruluyor..."
+pkg update -y -q
+pkg install -y -q curl unzip python python-pip clang libsndfile
+echo "  ✓ Sistem paketleri hazır"
+echo ""
 
-# İndir
-echo "İndiriliyor..."
+# ── 2. Dosyaları indir ────────────────────────────────────────────────────────
+echo "► Uygulama indiriliyor..."
 curl -fsSL "$ZIP_URL" -o "$TMP_ZIP"
-
-# Çıkart
 rm -rf "$TMP_DIR"
 unzip -q "$TMP_ZIP" -d "$TMP_DIR"
 rm -f "$TMP_ZIP"
 
-# Mevcut kurulum varsa yedekle
 if [ -d "$INSTALL_DIR" ]; then
     BACKUP="${INSTALL_DIR}_yedek_$(date +%Y%m%d_%H%M%S)"
     mv "$INSTALL_DIR" "$BACKUP"
-    echo "Eski kurulum yedeklendi: $BACKUP"
+    echo "  (Eski kurulum yedeklendi: $BACKUP)"
 fi
 
-# Yerleştir
 mv "$TMP_DIR"/android_mix_list_-generate-* "$INSTALL_DIR"
 rm -rf "$TMP_DIR"
+chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/create_shortcut.sh"
+echo "  ✓ Dosyalar hazır"
+echo ""
 
-chmod +x "$INSTALL_DIR/start.sh" \
-         "$INSTALL_DIR/setup_termux.sh" \
-         "$INSTALL_DIR/create_shortcut.sh"
+# ── 3. Python bağımlılıkları ──────────────────────────────────────────────────
+echo "► Python kütüphaneleri kuruluyor (bu biraz sürebilir)..."
+pip install -q -r "$INSTALL_DIR/requirements.txt"
+echo "  ✓ Kütüphaneler hazır"
+echo ""
 
-# Kurulumu çalıştır
-bash "$INSTALL_DIR/setup_termux.sh"
+# ── 4. Ana ekran kısayolu ─────────────────────────────────────────────────────
+echo "► Ana ekran kısayolu oluşturuluyor..."
+
+SHORTCUTS_DIR="$HOME/.shortcuts"
+mkdir -p "$SHORTCUTS_DIR"
+chmod 700 "$SHORTCUTS_DIR"
+
+cat > "$SHORTCUTS_DIR/Mix Liste Oluştur" <<EOF
+#!/bin/bash
+bash "$INSTALL_DIR/start.sh"
+EOF
+chmod +x "$SHORTCUTS_DIR/Mix Liste Oluştur"
+
+if am start -n com.termux.widget/.TermuxCreateShortcutActivity 2>/dev/null; then
+    echo "  ✓ 'Ekle' düğmesine basın — kısayol ana ekrana eklenecek"
+else
+    echo "  ✓ Kısayol hazır (.shortcuts klasörüne eklendi)"
+fi
+echo ""
+
+# ── Tamamlandı ────────────────────────────────────────────────────────────────
+echo "╔══════════════════════════════════════╗"
+echo "║         Kurulum tamamlandı!          ║"
+echo "║                                      ║"
+echo "║  Ana ekrandaki kısayola basarak      ║"
+echo "║  uygulamayı başlatabilirsiniz.       ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
