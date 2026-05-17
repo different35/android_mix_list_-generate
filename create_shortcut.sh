@@ -1,27 +1,36 @@
 #!/bin/bash
-# Termux:Widget için ana ekran kısayolu oluşturur.
-# Termux:Widget uygulaması ~/.shortcuts/ klasöründeki scriptleri widget olarak gösterir.
+# Ana ekrana doğrudan kısayol ekler.
+# Android 8+ güvenlik kuralı: sistem bir "Ekle?" onay diyaloğu gösterir.
+# Kullanıcı sadece o diyalogda "Ekle" ye basmak zorunda — başka hiçbir adım yok.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHORTCUT_NAME="Mix Liste Oluştur"
 SHORTCUTS_DIR="$HOME/.shortcuts"
-SHORTCUT_FILE="$SHORTCUTS_DIR/Mix Liste Oluştur"
 
+# Script dosyasını .shortcuts klasörüne yaz (Termux:Widget bunu okur)
 mkdir -p "$SHORTCUTS_DIR"
 chmod 700 "$SHORTCUTS_DIR"
 
-cat > "$SHORTCUT_FILE" <<EOF
+cat > "$SHORTCUTS_DIR/$SHORTCUT_NAME" <<EOF
 #!/bin/bash
-# Müzik klasörünü buraya gir:
-MUSIC_DIR="\${1:-/sdcard/Music}"
-
-bash "$SCRIPT_DIR/start.sh" "\$MUSIC_DIR"
+bash "$SCRIPT_DIR/start.sh" "\${1:-/sdcard/Music}"
 EOF
+chmod +x "$SHORTCUTS_DIR/$SHORTCUT_NAME"
 
-chmod +x "$SHORTCUT_FILE"
-
-echo "Kısayol oluşturuldu: $SHORTCUT_FILE"
-echo ""
-echo "Sonraki adım:"
-echo "  1. F-Droid'den 'Termux:Widget' uygulamasını yükleyin"
-echo "  2. Ana ekranda boş bir alana uzun basın → Widget ekle"
-echo "  3. Termux:Widget'ı seçin → 'Mix Liste Oluştur' görünecek"
+# Termux:Widget'ın CreateShortcutActivity'sini aç.
+# Bu aktivite sisteme "pinned shortcut" talebi gönderir:
+# Android ekranda "Ana ekrana eklensin mi?" diyaloğu gösterir.
+# Kullanıcı sadece "Ekle"ye basar → kısayol hazır.
+if am start -n com.termux.widget/.TermuxCreateShortcutActivity 2>/dev/null; then
+    echo ""
+    echo "  Diyalog açıldı — 'Ekle' düğmesine basın, kısayol hazır!"
+else
+    echo ""
+    echo "  [!] com.termux.widget bulunamadı, kuruluyor..."
+    pkg install termux-widget -y 2>/dev/null || true
+    # Tekrar dene
+    am start -n com.termux.widget/.TermuxCreateShortcutActivity 2>/dev/null || {
+        echo "  [!] Termux:Widget hâlâ açılamadı."
+        echo "      F-Droid'den manuel olarak yükleyin: search 'Termux:Widget'"
+    }
+fi
