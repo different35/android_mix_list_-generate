@@ -7,10 +7,10 @@ Android telefonunuzdaki müzikleri analiz eder, harmonik olarak uyumlu bir çalm
 Termux'u açın ve şu komutu çalıştırın:
 
 ```bash
-git clone https://github.com/different35/android_mix_list_-generate ~/music-analyzer && bash ~/music-analyzer/setup_termux.sh
+curl -fsSL https://raw.githubusercontent.com/different35/android_mix_list_-generate/main/install.sh | bash
 ```
 
-Kurulum bitince "**Ekle**" diyaloğu açılır — ekrana basın, kısayol ana ekrana eklenir.
+GitHub hesabı veya şifre gerekmez. Kurulum bitince "**Ekle**" diyaloğu açılır — basın, kısayol ana ekrana eklenir.
 
 ## Kullanım
 
@@ -18,7 +18,7 @@ Kurulum bitince "**Ekle**" diyaloğu açılır — ekrana basın, kısayol ana e
 2. Müzik klasörünü seç
 3. **Tüm klasörü analiz et** veya **Şarkı seç**
 4. Şarkı seçtiysen listeden işaretle → **Tamam**
-5. Bitti — playlist hazır, bildirim gelir
+5. Bitti — analiz ilerlerken bildirim çubuğunda durum görünür, bitince uyarı gelir
 
 Oluşturulan `mix_playlist.m3u` dosyasını VLC, Poweramp veya sıralı çalma destekleyen herhangi bir player ile açın.
 
