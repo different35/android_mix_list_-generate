@@ -1,58 +1,29 @@
-# Android Mix List Generator
+# Mix Liste Oluşturucu
 
-Termux üzerinde çalışan, Android telefonunuzdaki müzik dosyalarını analiz eden ve harmonik mixing uyumlu `.m3u` playlist oluşturan araç.
+Android telefonunuzdaki müzikleri analiz eder, harmonik olarak uyumlu bir çalma listesi oluşturur. Kurulum bir kez yapılır, sonrasında ana ekrandaki kısayola basmak yeterli.
 
-## Ne yapar?
+## Kurulum (bir kez)
 
-- Her şarkının **BPM** ve **key** (ton) bilgisini tespit eder
-- Major/minor modu Krumhansl-Schmuckler profilleriyle doğru tespit eder
-- **Camelot Wheel** sıralamasıyla harmonik uyumlu bir playlist üretir
-- İsteğe bağlı olarak dosya adlarına BPM ve key bilgisini ekler
-- Sıralı çalma özelliği olan herhangi bir player'da (VLC, Poweramp, vb.) `.m3u` listesini açın
-
-## Kurulum (Termux)
+Termux'u açın ve şu komutu çalıştırın:
 
 ```bash
-git clone https://github.com/different35/android_mix_list_-generate ~/music-analyzer
-cd ~/music-analyzer
-bash setup_termux.sh
+git clone https://github.com/different35/android_mix_list_-generate ~/music-analyzer && bash ~/music-analyzer/setup_termux.sh
 ```
 
-Kurulum sonunda bir diyalog açılır — **"Ekle"** ye basın, kısayol ana ekrana eklenir.
+Kurulum bitince "**Ekle**" diyaloğu açılır — ekrana basın, kısayol ana ekrana eklenir.
 
 ## Kullanım
 
-```bash
-# Klasör analizi + harmonik sıralı playlist oluştur
-bash start.sh /sdcard/Music
+1. Ana ekrandaki **Mix Liste Oluştur** kısayoluna bas
+2. Müzik klasörünü seç
+3. **Tüm klasörü analiz et** veya **Şarkı seç**
+4. Şarkı seçtiysen listeden işaretle → **Tamam**
+5. Bitti — playlist hazır, bildirim gelir
 
-# Dosya adlarını [BPM:xxx] [Key:xX] ile güncelle
-bash start.sh /sdcard/Music --rename
+Oluşturulan `mix_playlist.m3u` dosyasını VLC, Poweramp veya sıralı çalma destekleyen herhangi bir player ile açın.
 
-# Playlist çıktı konumunu belirt
-bash start.sh /sdcard/Music --output /sdcard/playlist.m3u
+## Ne yapar?
 
-# Tek dosya analizi
-bash start.sh --single /sdcard/Music/sarki.mp3
+Her şarkının BPM ve tonunu tespit eder, Camelot Wheel uyumuna göre sıralar. Bir şarkıdan diğerine geçişler harmonik olarak uyumlu olur — DJ mixing mantığıyla.
 
-# İlk 50 dosyayı analiz et
-bash start.sh /sdcard/Music --limit 50
-
-# Mutlak yollarla playlist oluştur (farklı klasöre taşıyacaksan)
-bash start.sh /sdcard/Music --absolute-paths
-```
-
-## Çıktı örneği
-
-```
-[1/120]   Deadmau5 - Strobe.mp3
-    BPM: 128 | Key: A minor | Camelot: 8A
-[2/120]   Eric Prydz - Call On Me.mp3
-    BPM: 126 | Key: A major | Camelot: 11B
-...
-
-Playlist oluşturuldu: /sdcard/Music/mix_playlist.m3u
-Toplam 120 parça
-```
-
-Playlist, Camelot Wheel komşuluğuna ve BPM yakınlığına göre otomatik sıralanır.
+Analiz sonuçları cihazda saklanır. Aynı şarkı bir daha analiz edilmez, her açılışta anında yüklenir.
