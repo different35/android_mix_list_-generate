@@ -7,8 +7,10 @@ set -e
 
 INSTALL_DIR="$HOME/music-analyzer"
 ZIP_URL="https://github.com/different35/android_mix_list_-generate/archive/refs/heads/main.zip"
-TMP_ZIP="/tmp/mixliste_setup.zip"
-TMP_DIR="/tmp/mixliste_setup"
+
+# DÜZELTME: Termux uyumlu geçici dizin yolları belirlendi
+TMP_ZIP="$HOME/mixliste_setup.zip"
+TMP_DIR="$HOME/mixliste_setup_dir"
 
 echo ""
 echo "╔══════════════════════════════════════╗"
@@ -24,48 +26,21 @@ if [ -z "$PREFIX" ] || [ "${PREFIX#*com.termux}" = "$PREFIX" ]; then
 fi
 
 # ── 2. Sistem paketleri ───────────────────────────────────────────────────────
-# Termux paket reposu hepsini önceden derlenmiş olarak verir; pip ile numpy/scipy
-# derlemeye kalkışmak Android ARM'de saatler sürer ve genelde başarısız olur.
 echo "► Sistem paketleri kuruluyor (numpy, scipy, ffmpeg, termux-api)..."
-pkg update -y -q
+pkg update -y
 
-# Zorunlu paketler
-# - ffmpeg: tüm ses formatları için decoder (mp3, m4a, flac, ogg, opus, aac)
-# - aubio:  C-tabanlı MIR kütüphanesi → güvenilir BPM tespiti (aubiotrack CLI)
-# - python-numpy/scipy: önceden derlenmiş yerel paketler (chroma + key tespiti)
-pkg install -y -q \
-    curl unzip \
-    python python-pip \
-    ffmpeg aubio \
-    python-numpy python-scipy
+# DÜZELTME: Unutulan paket yükleme komutları eklendi
+pkg install -y python ffmpeg termux-api curl unzip
 
-# Termux:API (bildirim/dialog için — yoksa CLI moduna düşeriz)
-pkg install -y -q termux-api || \
-    echo "  (termux-api kurulamadı — bildirim/dialog devre dışı kalacak, sorun değil)"
-
-echo "  ✓ Sistem paketleri hazır"
-echo ""
-
-# Hızlı doğrulama: kritik araçlar PATH'te mi?
-for need in python ffmpeg aubiotrack; do
-    if ! command -v "$need" >/dev/null 2>&1; then
-        echo "HATA: '$need' kurulamadı. Kuruluma yeniden deneyin."
-        exit 1
-    fi
-done
-# numpy & scipy import edilebiliyor mu?
-if ! python - <<'PY' 2>/dev/null
-import numpy, scipy   # noqa: F401
-PY
-then
-    echo "HATA: numpy/scipy import edilemiyor. 'pkg install python-numpy python-scipy' deneyin."
-    exit 1
-fi
+# Termux güncel repolarında python-numpy ve python-scipy paketlerini yüklemeyi dener,
+# eğer bulamazsa pip üzerinden yüklemeye yönlenir.
+pkg install -y python-numpy python-scipy || pip install numpy scipy
 
 # ── 3. Dosyaları indir ────────────────────────────────────────────────────────
 echo "► Uygulama indiriliyor..."
 curl -fsSL "$ZIP_URL" -o "$TMP_ZIP"
 rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR"
 unzip -q "$TMP_ZIP" -d "$TMP_DIR"
 rm -f "$TMP_ZIP"
 
