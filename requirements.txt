@@ -1,3 +1,5 @@
-librosa>=0.10.0
-numpy>=1.24.0
-mutagen>=1.46.0
+# Çalışma zamanı bağımlılıkları (Termux'ta `pkg install python-numpy python-scipy`
+# ile kurulur — pip ile saatlerce derler).
+# Ayrıca sistem aracı olarak `ffmpeg` (pkg install ffmpeg) zorunludur.
+numpy>=1.24
+scipy>=1.10

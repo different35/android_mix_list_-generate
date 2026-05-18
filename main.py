@@ -8,10 +8,10 @@ import argparse
 import subprocess
 from pathlib import Path
 
-import librosa
 import numpy as np
-from mutagen import File
+from scipy.signal import stft
 
+# Krumhansl-Schmuckler key-finding profiles (perceptual ratings, normalised at runtime)
 MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 
@@ -93,7 +93,7 @@ class ProgressReporter:
     # ── public ────────────────────────────────────────────────────────────────
 
     def loading(self, name: str):
-        """Dosya yüklenirken göster — librosa sessizliğini maskeler."""
+        """Dosya yüklenirken göster — analiz sessizliğini maskeler."""
         print(f"  ⏳ yükleniyor: {name[:50]}", flush=True)
 
     def track_done(self, name: str, from_cache: bool):
@@ -247,9 +247,34 @@ def camelot_compatibility(key1: str, key2: str) -> int:
 # ── Analyzer ──────────────────────────────────────────────────────────────────
 
 class MusicAnalyzer:
+    """ffmpeg + aubio + numpy/scipy ile çalışan analizci.
+
+    BPM: aubiotrack (C ile yazılmış, MIR endüstri standardı).
+    Key: chroma + Krumhansl-Schmuckler key-finding (numpy/scipy).
+    Audio I/O: ffmpeg subprocess.
+    """
+
+    SAMPLE_RATE = 22050         # Standart MIR örnekleme oranı (key analizi için)
+    N_FFT_CHROMA = 8192         # Chroma için: alt oktav (C2~65Hz) ayrımı şart
+    HOP_CHROMA = 2048
+
     def __init__(self):
         self.config_path = Path.home() / "music-analyzer" / "config" / "settings.json"
         self.load_config()
+        self._check_ffmpeg()
+
+    def _check_ffmpeg(self):
+        missing = []
+        if not shutil.which("ffmpeg"):
+            missing.append("ffmpeg")
+        if not shutil.which("aubiotrack"):
+            missing.append("aubio")
+        if missing:
+            sys.stderr.write(
+                f"HATA: Gerekli araçlar eksik: {', '.join(missing)}\n"
+                f"Termux'ta kurmak için: pkg install {' '.join(missing)}\n"
+            )
+            sys.exit(1)
 
     def load_config(self):
         if self.config_path.exists():
@@ -257,11 +282,15 @@ class MusicAnalyzer:
                 self.config = json.load(f)
         else:
             self.config = {
-                "analysis_duration": 30,
+                "analysis_duration": 45,
+                "analysis_offset": 20,
                 "music_folders": ["/storage/emulated/0/Music", "/storage/emulated/0/Download"],
-                "supported_formats": [".mp3", ".wav", ".m4a", ".flac"],
+                "supported_formats": [".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"],
             }
             self.save_config()
+        # Eski config'ler için varsayılan değerleri doldur
+        self.config.setdefault("analysis_duration", 45)
+        self.config.setdefault("analysis_offset", 20)
 
     def save_config(self):
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -278,27 +307,248 @@ class MusicAnalyzer:
             files.extend(folder.glob(f"**/*{ext}"))
         return sorted(files)
 
+    # ── Ses yükleme (ffmpeg subprocess) ───────────────────────────────────────
+
+    def _load_audio(self, file_path, duration=None, offset=None) -> np.ndarray | None:
+        """Sesi ffmpeg ile mono float32 olarak SAMPLE_RATE'e dönüştürerek belleğe oku."""
+        if duration is None:
+            duration = float(self.config["analysis_duration"])
+        if offset is None:
+            offset = float(self.config["analysis_offset"])
+
+        def _run(args):
+            try:
+                r = subprocess.run(args, capture_output=True, check=False)
+                return r.returncode, r.stdout
+            except (OSError, ValueError):
+                return -1, b""
+
+        base = [
+            "ffmpeg", "-v", "error", "-nostdin",
+            "-i", str(file_path),
+            "-t", f"{duration:.3f}",
+            "-f", "f32le",
+            "-ac", "1",
+            "-ar", str(self.SAMPLE_RATE),
+            "pipe:1",
+        ]
+        # Önce offset'li deneyelim — intro/outro genelde gürültülü
+        rc, raw = _run(["ffmpeg", "-v", "error", "-nostdin",
+                        "-ss", f"{offset:.3f}",
+                        "-i", str(file_path),
+                        "-t", f"{duration:.3f}",
+                        "-f", "f32le",
+                        "-ac", "1",
+                        "-ar", str(self.SAMPLE_RATE),
+                        "pipe:1"])
+        # Kısa dosya — baştan oku
+        if rc != 0 or len(raw) < self.SAMPLE_RATE * 4:
+            rc, raw = _run(base)
+        if rc != 0 or len(raw) < self.SAMPLE_RATE * 4:
+            return None
+
+        y = np.frombuffer(raw, dtype=np.float32).copy()
+        # Tepe normalizasyon — analiz seviye-bağımsız olsun
+        peak = float(np.max(np.abs(y))) if y.size else 0.0
+        if peak > 0:
+            y /= peak
+        return y
+
+    # ── BPM tespiti (aubio CLI) ───────────────────────────────────────────────
+
     def _analyze_bpm(self, file_path) -> int | None:
+        """aubiotrack ile BPM tespiti.
+
+        aubio (C ile yazılmış MIR kütüphanesi) beat zaman damgalarını saniye
+        cinsinden yazdırır. Median inter-beat-interval → BPM; medyan tek tük
+        atlanmış/yanlış onset'lere karşı dayanıklıdır.
+        """
         try:
-            y, sr = librosa.load(str(file_path), duration=self.config["analysis_duration"])
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            return round(float(np.atleast_1d(tempo)[0]))
-        except Exception as e:
+            # ffmpeg ile WAV'a decode et — aubio her formatı okuyamaz, ama WAV
+            # her zaman çalışır. Stdin/pipe yerine geçici dosya: aubio bazı
+            # sürümlerde named pipe ile sorun yaşıyor.
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                wav_path = tf.name
+            try:
+                decode = subprocess.run(
+                    [
+                        "ffmpeg", "-v", "error", "-nostdin", "-y",
+                        "-i", str(file_path),
+                        "-t", "90",            # ilk 90s yeterli
+                        "-ac", "1",
+                        "-ar", "44100",
+                        wav_path,
+                    ],
+                    capture_output=True, timeout=60,
+                )
+                if decode.returncode != 0:
+                    return None
+
+                result = subprocess.run(
+                    ["aubiotrack", "-i", wav_path],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0:
+                    return None
+
+                times = []
+                for tok in result.stdout.split():
+                    try:
+                        times.append(float(tok))
+                    except ValueError:
+                        continue
+                if len(times) < 8:
+                    return None
+
+                intervals = np.diff(times)
+                # En kısa ve en uzun %10'u at — outlier'lara karşı koruma
+                if len(intervals) > 10:
+                    intervals = np.sort(intervals)
+                    cut = max(1, len(intervals) // 10)
+                    intervals = intervals[cut:-cut]
+
+                median_interval = float(np.median(intervals))
+                if median_interval <= 0:
+                    return None
+
+                bpm = 60.0 / median_interval
+                if not (50.0 <= bpm <= 220.0):
+                    return None
+                return int(round(bpm))
+            finally:
+                try:
+                    Path(wav_path).unlink()
+                except OSError:
+                    pass
+        except (subprocess.SubprocessError, OSError) as e:
             print(f"    BPM hatası: {e}")
             return None
 
-    def _analyze_key_and_mode(self, file_path) -> tuple[str | None, str | None]:
+    # ── Ton (key) tespiti ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _estimate_tuning(mag: np.ndarray, freqs: np.ndarray) -> float:
+        """Standart akorttan sapmayı yarım-ton cinsinden tahmin et (-0.5..0.5)."""
+        # Her zaman çerçevesinde tepe frekansları topla, en yakın yarım-tona uzaklıklarını al
+        if mag.size == 0:
+            return 0.0
+        valid = (freqs >= 100.0) & (freqs <= 2000.0)
+        if valid.sum() < 8:
+            return 0.0
+        v_freqs = freqs[valid]
+        v_mag = mag[valid]
+        # Her sütunda en yüksek 8 binin sapması
+        deviations = []
+        weights = []
+        for col in range(v_mag.shape[1]):
+            col_mag = v_mag[:, col]
+            if col_mag.max() <= 0:
+                continue
+            top = np.argpartition(col_mag, -8)[-8:]
+            for idx in top:
+                f = v_freqs[idx]
+                if f <= 0:
+                    continue
+                midi = 12.0 * np.log2(f / 440.0) + 69.0
+                dev = midi - round(midi)  # -0.5..0.5
+                deviations.append(dev)
+                weights.append(col_mag[idx])
+        if not deviations:
+            return 0.0
+        deviations = np.array(deviations)
+        weights = np.array(weights)
+        # Ağırlıklı medyan benzeri: ağırlıklı ortalama
+        wsum = weights.sum()
+        if wsum <= 0:
+            return 0.0
+        avg = float(np.sum(deviations * weights) / wsum)
+        # Aşırı kaymaları bastır
+        return max(-0.5, min(0.5, avg))
+
+    def _analyze_key_and_mode(self, file_path):
         try:
-            y, sr = librosa.load(str(file_path), duration=self.config["analysis_duration"])
-            chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-            chroma_mean = np.mean(chroma, axis=1)
+            # Ton, BPM'den daha uzun bir pencere ister: tonalite parça boyunca daha kararlı,
+            # ama "yeterli akor değişimi" için en az 30s şart.
+            base_dur = float(self.config["analysis_duration"])
+            y = self._load_audio(file_path, duration=max(45.0, base_dur))
+            if y is None or len(y) < self.SAMPLE_RATE * 8:
+                return None, None
+
+            sr = self.SAMPLE_RATE
+            n_fft = self.N_FFT_CHROMA
+            hop = self.HOP_CHROMA
+
+            _, _, Z = stft(
+                y, fs=sr,
+                nperseg=n_fft,
+                noverlap=n_fft - hop,
+                window="hann",
+                return_onesided=True,
+                padded=False,
+                boundary=None,
+            )
+            mag = np.abs(Z)
+            freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+
+            # Akort sapması (semitone): -0.5..0.5 — referansı düzelt
+            tuning_dev = self._estimate_tuning(mag, freqs)
+
+            # Müzikal frekans aralığı: C2 (~65Hz) – C7 (~2093Hz)
+            f_min, f_max = 65.0, 2093.0
+            valid_mask = (freqs >= f_min) & (freqs <= f_max)
+            v_freqs = freqs[valid_mask]
+            v_mag = mag[valid_mask]
+            if v_freqs.size == 0:
+                return None, None
+
+            # Her bini ait olduğu pitch class'a yumuşak (Gaussian) ata.
+            # Sert mod-12 atamasından çok daha kararlı — yarım-ton sınırında titreşim azalır.
+            midi = 12.0 * np.log2(v_freqs / 440.0) + 69.0 - tuning_dev
+            pc_float = midi % 12.0           # 0..12
+            pcs = np.arange(12)[:, None]     # 12x1
+            # Dairesel uzaklık
+            dist = np.minimum(np.abs(pc_float[None, :] - pcs),
+                              12.0 - np.abs(pc_float[None, :] - pcs))
+            # σ ≈ 0.5 yarım-ton — komşu pitch class'a sızıntı küçük
+            weights = np.exp(-(dist ** 2) / (2.0 * 0.5 ** 2))   # 12 x F
+            # 1/f^a ağırlığı: bas seslerin baskın olmasını dengele (a≈0.5 ılımlı)
+            freq_weight = 1.0 / np.sqrt(v_freqs)
+            chroma = weights @ (v_mag * freq_weight[:, None])    # 12 x T
+
+            # Çerçeve enerjisi düşük olanları (sessizlik) at
+            frame_energy = chroma.sum(axis=0)
+            if frame_energy.max() <= 0:
+                return None, None
+            active = frame_energy > frame_energy.max() * 0.1
+            if active.sum() < 5:
+                return None, None
+
+            # Çerçeve başına normalize → akor değişimleri eşit ağırlıkta sayılır
+            norm = chroma[:, active] / (frame_energy[active] + 1e-12)
+            chroma_mean = norm.mean(axis=1)
+            # Vektörü 0-ortalamalı yap → korelasyon
+            chroma_centered = chroma_mean - chroma_mean.mean()
+
+            major_prof = MAJOR_PROFILE - MAJOR_PROFILE.mean()
+            minor_prof = MINOR_PROFILE - MINOR_PROFILE.mean()
+
             best_score, best_key, best_mode = -np.inf, None, None
+            cn = float(np.linalg.norm(chroma_centered))
+            mn = float(np.linalg.norm(major_prof))
+            nn = float(np.linalg.norm(minor_prof))
+            if cn == 0 or mn == 0 or nn == 0:
+                return None, None
             for i in range(12):
-                rotated = np.roll(chroma_mean, -i)
-                for profile, mode in ((MAJOR_PROFILE, "major"), (MINOR_PROFILE, "minor")):
-                    score = float(np.corrcoef(rotated, profile)[0, 1])
+                rotated = np.roll(chroma_centered, -i)
+                for profile, mode, pn in (
+                    (major_prof, "major", mn),
+                    (minor_prof, "minor", nn),
+                ):
+                    score = float(np.dot(rotated, profile) / (cn * pn))
                     if score > best_score:
                         best_score, best_key, best_mode = score, KEY_NAMES[i], mode
+
             return best_key, best_mode
         except Exception as e:
             print(f"    Key hatası: {e}")
